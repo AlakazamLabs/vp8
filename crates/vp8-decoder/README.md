@@ -1,0 +1,163 @@
+# vp8-decoder
+
+A VP8 video decoder in pure Rust (no dependencies, no C), following
+RFC 6386. Safe code throughout, except for small NEON (aarch64) and SSE2
+(x86_64) loop-filter kernels (see Security).
+
+It decodes every bitstream version (0 to 3), with:
+- keyframes and interframes;
+- all intra modes and all inter modes, split motion vectors included;
+- segmentation;
+- the normal and simple loop filters;
+- multiple token partitions;
+- probability updates, saved or kept;
+- the last, golden and alt-ref references, with sign bias and buffer copies;
+- hidden frames.
+
+It matches the WebM project's 59 VP8 test vectors bit for bit (see Testing).
+
+**MSRV:** Rust 1.80 (`rust-version` in Cargo.toml).
+
+## Using it
+
+Input is one raw VP8 frame at a time, starting at the frame tag: no IVF,
+WebM or RTP framing. That is what an RTP depacketiser (RFC 7741) produces.
+
+```rust
+use vp8_decoder::{DecodeError, Decoder};
+
+// Your app: draw a frame, or ask the sender for a keyframe (PLI).
+fn show(_i420: Vec<u8>, _width: u32, _height: u32) {}
+fn request_keyframe() {}
+
+fn receive(frames: &[Vec<u8>]) {
+    let mut decoder = Decoder::new();
+    for frame in frames {
+        // One raw VP8 frame, as an RTP depacketiser hands it over.
+        match decoder.decode(frame) {
+            Ok(Some(picture)) => show(picture.to_i420(), picture.width, picture.height),
+            Ok(None) => {} // a hidden frame: references updated, nothing to show
+            Err(DecodeError::NeedKeyframe) => {} // dropped until a keyframe
+            Err(_) => request_keyframe(), // corrupt
+        }
+    }
+}
+```
+
+- **`Picture` borrows the decoder.** It points into the decoder's own frame
+  buffer, so it lives until the next call to `decode`. To keep a frame,
+  copy it with `Picture::to_i420()` or `write_i420()`. It is I420 at the
+  frame's display size; chroma is `(width + 1) / 2` by `(height + 1) / 2`.
+- **The size comes from the stream:** every keyframe carries it, and the
+  decoder reallocates when it changes. `Decoder::dimensions()` returns it.
+- **Errors** (`DecodeError`):
+  - `NeedKeyframe`: an interframe before the first keyframe, or after an error;
+  - `Truncated`: the frame is shorter than its headers say;
+  - `Invalid`: the frame is malformed;
+  - `Unsupported`: a bitstream version above 3.
+
+  After any error the decoder waits for the next keyframe, and a real-time
+  receiver should ask for one (PLI).
+- **`frame_info()`** reads a frame's uncompressed header without decoding it:
+  keyframe flag, version, whether it is shown, and a keyframe's size.
+- **The scaling bits** in the keyframe header are reported in `Dimensions`
+  and otherwise ignored, as RFC 6386 Section 9.1 allows. Pictures come out
+  at the coded size.
+- **`ivf::IvfReader`** reads IVF files (the container the test vectors use)
+  frame by frame.
+
+## Speed
+
+Frames per second on one core, decoding camera-like streams (a slow pan,
+a moving object and sensor noise) made by vp8-encoder, one keyframe then
+interframes. Version 0.1.0 in brackets.
+
+| Size, bitrate | Apple M4 | x86_64 (Xeon E-2288G) |
+|---|---|---|
+| 320x180, 300 kbit/s | 5,420 (3,140) | 2,580 (1,120) |
+| 640x360, 600 kbit/s | 1,720 (960) | 820 (310) |
+| 640x360, 1.2 Mbit/s | 1,340 (790) | 680 (280) |
+| 1280x720, 1.2 Mbit/s | 560 (310) | 270 (70) |
+
+At 640x360 and 600 kbit/s on the M4, a frame's 0.6 ms is split about:
+inter prediction 43%, tokens 24%, loop filter 20%, inverse transforms 7%,
+modes 6%. vp8-encoder's `decode_speed` example (in the repository)
+produces these numbers; with `RUSTFLAGS="--cfg vp8_stage_timers"` it also
+prints the split.
+
+## Testing
+
+The conformance test needs a checkout of the repository: `scripts/` and
+`tests/` are not in the published crate.
+
+```sh
+crates/vp8-decoder/scripts/fetch-test-vectors.sh /tmp/vp8-vectors
+VP8_TEST_VECTORS=/tmp/vp8-vectors cargo test -p vp8-decoder --release --features conformance
+```
+
+The script downloads the WebM project's vectors (`vp80-00-comprehensive-001`
+to `018`, plus the intra, inter, segmentation, partitions, sharpness and
+small-size sets) and their per-frame MD5 files. It checks every file
+against `tests/vectors.sha256`. The vectors are test data and are not in
+this repository.
+
+The `conformance` feature only switches on that test, which decodes every
+frame and compares the MD5 of each shown frame's I420 data with the
+published one. It needs `VP8_TEST_VECTORS` and fails, never skips, without
+it. A plain `cargo test -p vp8-decoder` runs the unit tests only.
+
+## Security
+
+The decoder is meant for untrusted input: malformed frames return errors
+rather than panicking.
+
+Its only `unsafe` code is in two modules, `neon.rs` (aarch64) and
+`sse2.rs` (x86_64): the loop filter's SIMD kernels, written with
+`std::arch` intrinsics. The rest of the crate is `deny(unsafe_code)`.
+They compile only when the target has the feature (NEON or SSE2), so a
+target without it gets the portable code. Each kernel asserts the length
+of every slice it reads and writes before touching it, and the code that
+calls it cuts those slices with checked arithmetic and ordinary bounds
+checks. Whatever the input, including the strides and positions given to
+the hidden shared modules, a bad value panics and nothing outside the
+planes is touched. Their output matches the portable code
+byte for byte (tests compare them with the 0.1.0 scalar filter on random
+pictures at every filter level and sharpness). Build with
+`RUSTFLAGS="--cfg vp8_portable"` to leave them out; the decoder is then
+entirely safe Rust, and about half as fast on aarch64.
+
+**Reporting:** please report a crash or hang on a malicious stream, or
+any other security problem, privately, never in a public issue: see
+[SECURITY.md](https://github.com/AlakazamLabs/vp8/blob/main/SECURITY.md) (GitHub's private vulnerability reporting on the
+Security tab of [AlakazamLabs/vp8](https://github.com/AlakazamLabs/vp8/security)).
+
+## Issues
+
+Report issues on [AlakazamLabs/vp8's Issues](https://github.com/AlakazamLabs/vp8/issues), and security
+problems privately through [SECURITY.md](https://github.com/AlakazamLabs/vp8/blob/main/SECURITY.md).
+The source is in [`crates/vp8-decoder`](https://github.com/AlakazamLabs/vp8/tree/main/crates/vp8-decoder)
+of that repository:
+- [report a bug or ask a question](https://github.com/AlakazamLabs/vp8/issues/new?template=bug_report.yml)
+  (a short template for the vp8 crates);
+- [the vp8 issues so far](https://github.com/AlakazamLabs/vp8/issues?q=label%3Avp8).
+
+Please give the crate version, your platform and CPU and, if you can
+share one, a sample stream or a minimal repro. A crash or hang on a
+malicious stream is a security problem: report it privately (see Security).
+
+## Licence, provenance and patents
+
+This crate is an independent port of the reference decoder in RFC 6386
+Section 20. Its licence is `(MIT OR Apache-2.0) AND BSD-3-Clause`:
+- the RFC code's BSD-3-Clause notice is in NOTICE;
+- our own code is MIT OR Apache-2.0.
+
+**If you distribute binaries** that include this crate, you must reproduce
+the BSD-3-Clause notice in NOTICE, as that licence requires.
+
+**Patents:** no patent licence is granted beyond Apache-2.0's for our own
+contributions. Google's VP8 patent grant covers only Google's own code.
+Users who want patent cover can join Google's free VP8 Patent
+Cross-License themselves.
+
+PROVENANCE.md records exactly which sources were used.

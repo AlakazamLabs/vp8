@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["crates/vp8-decoder", "crates/vp8-encoder"]
+
+# Tests and examples run optimised in dev builds too: decoding and encoding
+# video unoptimised is slow. This affects only builds in this repository,
+# never the published crates.
+[profile.dev.package.vp8-decoder]
+opt-level = 3
+[profile.dev.package.vp8-encoder]
+opt-level = 3
